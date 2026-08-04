@@ -34,7 +34,10 @@ stor4build  run-icetank-dynamic \<path_to_osm\> \<path_to_epw\> --openstudio "C:
 ## Charge Controls Functions
 The scheduling algorithm is written in Python. All of the functions are  in `stor4build/src/stor4build/dynamic_charge_controls.py`
 
-List of dependencies:
+The only function we call directly is `generate_schedule()`. This calls other functions as necessary to get the required inputs for the scheduling. 
+
+
+### List of Python dependencies:
 ```python
 import pandas as pd
 import numpy as np
@@ -54,12 +57,8 @@ __epw__ is a package for EnergyPlus weather files (.epw). It can be installed us
 pip install git+https://github.com/building-energy/epw.git@master
 ```
 
-The optimization relies on being able to obtain the baseline electric and thermal loads, chiller performance curves, chiller sizing, outdoor air temperature, and other data pulled from the various input files. This was challenging to fully automate and a common cause of bugs when trying to run with different models. We think it is working now, but if it ends in an `IndexError`, this is a probable culprit. 
-- OAT: from .epw used to run the model
-- baseline loads and performance: from eplusout.csv from the baseline run
-- chiller parameters: from input .idf generated
+Note: it should be possible to remove `epw`. The only thing it's currently used for is OAT (drybulb). See "Required Inputs"
 
-The only function we call directly is `generate_schedule()`. This calls other functions as necessary to get the required inputs for the scheduling. 
 
 ### Using `generate_schedule()`
 
@@ -73,6 +72,45 @@ Parameters
 Returns
 - os.path to the resulting schedule file (.csv) containing the optimized charging schedule and charging temperature, in the format required for the add_pytank_with_schedule measure
 
+### Required Inputs
+
+The optimization relies on being able to obtain the baseline electric and thermal loads, chiller performance curves, chiller sizing, outdoor air temperature, and other data pulled from the various input files. This was challenging to fully automate and a common cause of bugs when trying to run with different models. We think it is working now, but if it ends in an `IndexError`, this is a probable culprit. 
+- OAT: _current testing obtained it_ from .epw used to run the model, _however, it would likely be easier to add an eplusout.csv column for `'Environment:Site Outdoor Air Drybulb Temperature [C](TimeStep)'`. The `dynamic_charge_controls.py` existing code automatically looks for the aforementioned OAT column in eplusout first, then if not found, attempts to load it from the .epw file instead._ 
+	- _If adding this to eplusout, iff it's trivially easy, it might be worth adding relative humidity, wind speed, and solar radiation in case we decide to add these as factors to compute the schedule in a future revision, but unlikely in the near-term_
+- baseline loads and performance: from eplusout.csv from the baseline run
+- chiller parameters: from input .idf generated
+
+_Note: There may be better places to get the data from. We're open to discussion and modifying the data gathering functions for the controls appropriately for ease of integration_
+
+#### List of datapoints & columns required
+1. __eplusout.csv__ columns
+	1. `'Date/Time'`
+	1. `"NUM TANKS:Schedule Value [](TimeStep)"` __NOTE: If we pass this in from somewhere else, we could avoid needing this in eplusout, which would allow us to use a non-TES baseline run__
+	1. `"*:Chiller Electricity Rate [W](TimeStep)"`
+	1. `"*:Chiller Condenser Heat Transfer Rate [W](TimeStep)"`
+	1. `"*:Chiller Evaporator Cooling Rate [W](TimeStep)"`
+	1. `"*:Chiller Part Load Ratio [](TimeStep)"`
+	1. `"*:Chiller COP [W/W](TimeStep)"`
+	1. `"Electricity:Facility [J](TimeStep)"`
+	1. (Optional: `'Environment:Site Outdoor Air Drybulb Temperature [C](TimeStep)'`, if not it will go to EPW file)
+1. __epw file__ Weather data: Outdoor air temperature - can be obtained from eplusout.csv if it gets added there, but it is currently being obtained from the epw file. See note on OAT under "Required Inputs" header
+1. __in.idf__  (see `get_idf_info()`)
+	1. `RunPeriod,` 
+	1. `Curve:Biquadratic,` for `EIRFT` 
+	1. `Curve:Quadratic,` for `fQRatio`  
+	1. `Chiller:Electric:EIR,`
+		1. Reference COP
+		1. Minimum Part Load Ratio
+		1. Minumum Unloading Ratio
+1. __eplusout.eio__
+	1. `Chiller:Electric:EIR`, `Design Size Reference Capacity [W]` for each chiller (see `get_chiller_design_capacities()`)
+1. __From user arguments, will use a default if not specified__
+	1. `--electric-rate`
+	1. `--demand-charge-rate`
+	1. `--demand-charge-schedule`
+1. __passed in automatically__
+	1. `--schedule_file`
+
 ## Impacts on other files/codes in the repo
 1. The OSM file needs some of the `OS:Output:Variable` outputs that were removed since the old s4b repo, as these are inputs to the dynamic charge controls. We added them back to some of the `.osm` files. See the "Add Output:Variable to osm files for dynamic charge controls" commit. 
 2. The `run-icetank-dynamic` function is added to `src/stor4build/cli/__init__.py`. Appropriate entries are also added to the --help output
@@ -80,12 +118,21 @@ Returns
 
 To our knowledge, the additions/changes do not impact the functioning of anything else in the repo.
 
+## Brainstorming on integration for GUI
+Here's a rough idea of what we think needs to be added (not necessarily the best way to do this, but mentioning in case it's useful)
+- Toggle button to activate dynamic charge controls, with checks to ensure it only is selectable for icetank
+- Inputs for electricity rate & demand charge rate and on the backend, a way to convert it to the format used in the controls (see "Using `generate_schedule()`" section)
+- Remove inputs for charge/discharge start/end
+- We assume there's already a way to select bldg type, storage size, and location for weather
+
 ## Caveats/known bugs and quirks
-__Timestep__: Currently, the code only works with a timestep of 15 minutes (or 4 timesteps per hour). This is enforced in the `add_pytank_with_schedule` measure
+__Timestep__: Currently, the code only works with a timestep of 15 minutes (or 4 timesteps per hour). This is enforced in the `add_pytank_with_schedule` measure. _LBNL is working on refactoring the code to handle any timestep between 1 minute and 1 hour, treating as low priority for now unless others request it sooner._
 
 __Controls Schedule Issues:__ During testing, periods of up to 1 month in the summer led to fairly effective schedules. However, during the full integration, we observed that runperiods that include the full year often have strange results, particularly large chunks of time in "discharge" mode during the non-cooling season, with no "charge" periods to offset it. We are investigating several possible causes, all of which involve small tweaks to the controls logic. Fixing this should not impact the integration with the overall tool. 
 
 __Python Warnings__: There are a few FutureWarnings that pop up when running the code. We fixed most of them, but a few are still lurking. We tested with Python 3.13 and 3.8. If others using newer versions get an actual error due to these, let us know and we'll figure it out. 
+
+__Expanding to other TES__: In _theory_, these controls should work for any TES. We'd need to change the input parameters and constraints significantly to handle other cases (and the data frameworks), then test and validate the controls. This will have to be left for future work.
 
 __Modifying/Recompiling__: if anything is changed in the Python scripts, first need to run this command to reflect the changes when running stor4build commands. 
 

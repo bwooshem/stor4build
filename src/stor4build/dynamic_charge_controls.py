@@ -873,7 +873,7 @@ def generate_schedule_file(dms, info, file_path):
     df.to_csv(file_path, index=False)
 
 
-def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_charge_rate=None, electric_rate=None, epw_file=None):
+def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_charge_rate=None, electric_rate=None, epw_file=None, export_full_schedule_for_debug = False):
     """
     Generates the optimized load shifting schedule using dynamic charge controls. 
 
@@ -927,7 +927,8 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
     # searching for a non-unavoidable expensive hour, treat the schedule as fully optimized (no more
     # meaningful improvements are distinguishable) and stop the outer loop, rather than looping
     # through a large tied block that can never advance past an already-unavoidable low-index hour.
-    HOURS_WITH_SAME_INCREMENTAL_COST_THRESHOLD = 100
+    hours_max_demand = (df['Demand Period'] == df['Demand Period'].max()).sum()
+    HOURS_WITH_SAME_INCREMENTAL_COST_THRESHOLD = hours_max_demand + 1 # was 100, testing if this allows for regular load shift or not
     schedule_fully_optimized = False
     # Otherwise, it will loop thorugh all available hours
     # Note: added a /2 to speed up this loop, acknowledging where there are diminishing returns
@@ -1441,5 +1442,8 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
 
     generate_schedule_file(dms1,info,output_path)
     print(f"[dynamic_charge_controls] Dynamic charge schedule saved to: {output_path}")
+
+    if export_full_schedule_for_debug:
+        dms1.to_csv(os.path.join(baseline_run_path, "..", "..", "full_schedule.csv"))
 
     return output_path

@@ -7,9 +7,11 @@ These controls address the challenges of:
 - Charging can create new demand charges by leading to spikes in demand, not good for electric tariffs with high demand charges
 - Account for changes in COP of charging/discharging
 
-## Summary of Current Development Status (as of July 31, 2026)
+## Summary of Current Development Status (as of Aug 26, 2026)
 
 The control functions are stable in that they will run for the various models, but we are aware of several bugs that are still work in progress. __The inputs, outputs, and general structure of the control functions are expected to remain the same.__ However, the processing/logic within the controls for the exact charge/discharge schedule still needs to be improved. The only file we anticipate needing to modify is `stor4build/src/stor4build/dynamic_charge_controls.py`, which is a self-contained file for the controls functions. Thus, we recommend that __others in the project team may begin integration with the GUI tool simultaneously as we finalize the control functions.__ Expect that with some building models and weather file combinations, the schedules might not be very effective and occasionally be nonsensical at this point. The schedules will improve over time as we wrap up development.
+
+An update in late-Aug 2026 fixed bugs where (1) the schedules sometimes did not fully optimize because a catch would cause the scheduler to exit partway through the runperiod, and (2) optimization is now by month (approximating a billing period) rather by year, improving cost savings by ~3-5\% over the previous (July 31, 2026) version.
 
 Scope: _Should_ work for any chiller-based model that can use icetank storage. Developed primarily using LargeOffice_4A_2019.osm, tested that it runs without crashing for LargeDataCenterHighITE, LargeHotel.
 
@@ -28,7 +30,7 @@ Command line function has been developed, loosely adapted from `run-icetank`. Re
 Run using
 
 ```bash
-stor4build  run-icetank-dynamic \<path_to_osm\> \<path_to_epw\> --openstudio "C:\openstudio-3.7.0\bin\openstudio.exe" -r \<path_to_results_folder\> -m \<path_to stor4build/measures\> --ntanks \<int\>
+stor4build  run-icetank-dynamic <path_to_osm> <path_to_epw> --openstudio "C:\openstudio-3.7.0\bin\openstudio.exe" -r <path_to_results_folder> -m <path_to stor4build/measures> --ntanks <int>
 ```
 
 ## Charge Controls Functions
@@ -129,6 +131,7 @@ Here's a rough idea of what we think needs to be added (not necessarily the best
 __Timestep__: Currently, the code only works with a timestep of 15 minutes (or 4 timesteps per hour). This is enforced in the `add_pytank_with_schedule` measure. _LBNL is working on refactoring the code to handle any timestep between 1 minute and 1 hour, treating as low priority for now unless others request it sooner._
 
 __Controls Schedule Issues:__ During testing, periods of up to 1 month in the summer led to fairly effective schedules. However, during the full integration, we observed that runperiods that include the full year often have strange results, particularly large chunks of time in "discharge" mode during the non-cooling season, with no "charge" periods to offset it. We are investigating several possible causes, all of which involve small tweaks to the controls logic. Fixing this should not impact the integration with the overall tool. 
+- Update: changing the code to break the initial optimization to minimize costs by month instead of the entire runperiod improved the situation by about 3-5\%, but 
 
 __Python Warnings__: There are a few FutureWarnings that pop up when running the code. We fixed most of them, but a few are still lurking. We tested with Python 3.13 and 3.8. If others using newer versions get an actual error due to these, let us know and we'll figure it out. 
 

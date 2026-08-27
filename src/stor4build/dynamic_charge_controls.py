@@ -873,38 +873,75 @@ def generate_schedule_file(dms, info, file_path):
     df.to_csv(file_path, index=False)
 
 
-def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_charge_rate=None, electric_rate=None, epw_file=None, export_full_schedule_for_debug = False):
+def _get_calendar_month_blocks(start_date, end_date):
     """
-    Generates the optimized load shifting schedule using dynamic charge controls. 
+    Break a date range into calendar-month-bounded [start, end) blocks.
 
-    Parameters
-    - baseline_run_path: os.path, to "run" folder where the results from the baseline went
-    - demand_charge_schedule: list or array, 24-hour demand charge period schedule, with different periods mapped to integers. The lowest cost period should be `0`, then the next highest `1`, `2`, etc. If not provided, will default to a sample schedule. 
-    - demand_charge_rate: list, rates for different demand periods and overall demand. The indexes map to the numbering in demand_charge_schedule, such that the lowest cost period demand charge is in index 0, then the next highest in index 1, etc. The length should be 1 more than the number of different demand_charge_schedule periods. The final entry, index -1, is an overall demand charge applied to the highest consumption regardless of time. Any of these may be 0, but all must be included for the code to work correctly. If not provided, will default to a sample tariff rate. 
-    - electric_rate: list or array, 24-hour electricity rates in $/kWh. If not provided, will default to a sample rate schedule. 
-    - epw_file: os.path, to the EnergyPlus Weather file (.epw) used to run the simulation. If none, it will default to in.epw (note: current stor4build repo does not create the in.epw, so it will likely crash if not provided)
+    Used to split a long simulation period (e.g. several months or a full year) into
+    per-calendar-month chunks so the ideal-schedule optimization loop in generate_schedule()
+    can be run independently on each month (with its own demand-charge peak tracking, matching
+    how utility demand charges typically reset monthly) and the results merged back together.
 
-    Returns
-    - os.path to the resulting schedule file (.csv) containing the optimized charging schedule and charging temperature, in the format required for the add_pytank_with_schedule measure
+    Parameters:
+    - start_date: str or pd.Timestamp, overall start of the range (inclusive)
+    - end_date: str or pd.Timestamp, overall end of the range. Any timestamp occurring on this
+        date (any hour) is included
+
+    Returns:
+    - list of (block_start, block_end_exclusive) pd.Timestamp tuples, in chronological order.
+        The first block starts exactly at start_date and the last block's exclusive end is set
+        just past end_date, so together the blocks exactly cover [start_date, end_date] with no
+        gaps or overlaps. Interior boundaries fall exactly on the first moment of a calendar
+        month, so blocks align with calendar months while the first and last blocks are
+        naturally clipped to the overall start_date/end_date.
     """
+    start_ts = pd.Timestamp(start_date)
+    # Push the exclusive end just past end_date's day so any timestamp occurring on end_date
+    # (at any hour) is included in the final block.
+    end_ts_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
 
-    if debug: print(f"[dynamic_charge_controls] run\ngenerate_schedule({baseline_run_path}, {demand_charge_schedule}, {demand_charge_rate}, {electric_rate}, {epw_file})")
+    blocks = []
+    current_start = start_ts
+    while current_start < end_ts_exclusive:
+        next_month_start = current_start.normalize() + pd.offsets.MonthBegin(1)
+        block_end_exclusive = min(next_month_start, end_ts_exclusive)
+        blocks.append((current_start, block_end_exclusive))
+        current_start = block_end_exclusive
 
-    df, info = preprocess_baseline(baseline_run_path, demand_charge_schedule, demand_charge_rate, electric_rate, epw_file=epw_file)
-    demand_charge_rate = info['demand_charge_rate']
+    return blocks
 
-    df["Electricity:Facility [kW]"] = df["Electricity:Facility [W]"] / 1000
 
+def _run_ideal_schedule_loop(sch, info, demand_charge_rate, rate):
+    """
+    Run the "first loop" ideal load-shifting schedule optimization (ignoring chiller operating
+    modes) on a single contiguous block of the schedule dataframe.
+
+    This is the core optimization algorithm originally embedded directly in generate_schedule().
+    It has been extracted verbatim (no logic changes) into its own function so it can be run
+    independently on sub-ranges of the full simulation period (e.g. calendar-month blocks, each
+    with its own demand-charge peak tracking) when the overall period spans many months, with the
+    results merged back together afterward. When the overall period is short enough to run as a
+    single block, this function is called exactly once and behaves identically to the original
+    in-line code.
+
+    Parameters:
+    - sch: pd.DataFrame, the schedule block to optimize. Must have a contiguous 0..N-1
+        RangeIndex and a 'datetime' column sorted chronologically, along with the columns
+        produced by preprocess_baseline() (e.g. 'Thermal Load [kW]', 'Cooling', 'Storage',
+        'Electricity Consumption', 'COP', 'Cost [kWh]', 'Demand Period', the electricity rate
+        column, 'Electricity:Facility [kW]', etc.)
+    - info: dict, system specifications (see preprocess_baseline)
+    - demand_charge_rate: list, rates for different demand periods and overall demand
+    - rate: str, column name for the electricity rate (e.g. 'Electricity Rate [$/kWh]')
+
+    Returns:
+    - pd.DataFrame, the optimized schedule block with 'Cooling', 'Storage',
+        'Electricity Consumption', 'COP', 'Cost [kWh]', and 'inc_cost' updated to reflect the
+        ideal load-shifted schedule
+    """
     total_cost_log = []
     hours_tested=[]
     unavoidable_hours = []
-
-    sch = df.loc[(df['datetime'] >= info["start_date"]) & (df['datetime'] <= info["end_date"])]
-    # df comes from preprocess_baseline() with a DatetimeIndex ('datetime' set as the index).
-    # The optimization loop below relies on a plain sequential integer index (e.g. cheap_hour.name + 1
-    # meaning "the next hour", int(cheap_hour.name) casts, etc.), so reset to a RangeIndex here while
-    # keeping 'datetime' available as a regular column for date-based filtering/lookups.
-    sch = sch.reset_index(drop=True)
 
     sch, curr_max_elec = applyDemandCharge(sch, demand_charge_rate, cost='Electricity Rate [$/kWh]', elec = 'Electricity:Facility [kW]', demandWindow='Demand Period', demandCost='Demand Cost', debug=False)
 
@@ -914,7 +951,6 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
     n_small = 1
     iter_plot = False
     total_hours = len(sch.index)
-    rate = 'Electricity Rate [$/kWh]'
 
     # -------------------------------------------
     # First loop to generate ideal schedule ignoring modes
@@ -927,7 +963,7 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
     # searching for a non-unavoidable expensive hour, treat the schedule as fully optimized (no more
     # meaningful improvements are distinguishable) and stop the outer loop, rather than looping
     # through a large tied block that can never advance past an already-unavoidable low-index hour.
-    hours_max_demand = (df['Demand Period'] == df['Demand Period'].max()).sum()
+    hours_max_demand = (sch['Demand Period'] == sch['Demand Period'].max()).sum()
     HOURS_WITH_SAME_INCREMENTAL_COST_THRESHOLD = hours_max_demand + 1 # was 100, testing if this allows for regular load shift or not
     schedule_fully_optimized = False
     # Otherwise, it will loop thorugh all available hours
@@ -1195,12 +1231,82 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
             total_cost_log.append(totalcost1)
             n_small += 1
 
+    return sch
+
+
+def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_charge_rate=None, electric_rate=None, epw_file=None, export_full_schedule_for_debug = False):
+    """
+    Generates the optimized load shifting schedule using dynamic charge controls. 
+
+    Parameters
+    - baseline_run_path: os.path, to "run" folder where the results from the baseline went
+    - demand_charge_schedule: list or array, 24-hour demand charge period schedule, with different periods mapped to integers. The lowest cost period should be `0`, then the next highest `1`, `2`, etc. If not provided, will default to a sample schedule. 
+    - demand_charge_rate: list, rates for different demand periods and overall demand. The indexes map to the numbering in demand_charge_schedule, such that the lowest cost period demand charge is in index 0, then the next highest in index 1, etc. The length should be 1 more than the number of different demand_charge_schedule periods. The final entry, index -1, is an overall demand charge applied to the highest consumption regardless of time. Any of these may be 0, but all must be included for the code to work correctly. If not provided, will default to a sample tariff rate. 
+    - electric_rate: list or array, 24-hour electricity rates in $/kWh. If not provided, will default to a sample rate schedule. 
+    - epw_file: os.path, to the EnergyPlus Weather file (.epw) used to run the simulation. If none, it will default to in.epw (note: current stor4build repo does not create the in.epw, so it will likely crash if not provided)
+
+    Returns
+    - os.path to the resulting schedule file (.csv) containing the optimized charging schedule and charging temperature, in the format required for the add_pytank_with_schedule measure
+    """
+
+    if debug: print(f"[dynamic_charge_controls] run\ngenerate_schedule({baseline_run_path}, {demand_charge_schedule}, {demand_charge_rate}, {electric_rate}, {epw_file})")
+
+    df, info = preprocess_baseline(baseline_run_path, demand_charge_schedule, demand_charge_rate, electric_rate, epw_file=epw_file)
+    demand_charge_rate = info['demand_charge_rate']
+
+    df["Electricity:Facility [kW]"] = df["Electricity:Facility [W]"] / 1000
+
+    rate = 'Electricity Rate [$/kWh]'
+
+    # -------------------------------------------
+    # Generate ideal schedule, ignoring modes (1st loop)
+    # -------------------------------------------
+    # The ideal operation schedule in `_run_ideal_schedule_loop()` is run for up to 1 month at a time.
+    # If the runperiod < 30 days, it runs just as a single "block"
+    # else, the runperiod is split into blocks of 1 month at a time (currently by calendar month, so breaks on 1st of every month)
+    # Demand charges are calculated per period ("block")
+    # Note: future versions could have options to choose a different day to do the month breaks, and/or different billing periods (occasionally we see 60-day or 15-day)
+    # Note: prior versions attempted to do the entire runperiod all at once, which led to a single demand charge
+    # target for the whole year rather than by period, and seemed to cause some other strange behavior including
+    # excessive discharge periods.
+    total_days = (pd.Timestamp(info["end_date"]) - pd.Timestamp(info["start_date"])).total_seconds() / 86400
+
+    if total_days < 30:
+        blocks = [(pd.Timestamp(info["start_date"]), None)]
+        if debug: print(f"[dynamic_charge_controls] Date range spans {total_days:.1f} days (< 30); running ideal schedule as a single block.")
+    else:
+        blocks = _get_calendar_month_blocks(info["start_date"], info["end_date"])
+        if debug: print(f"[dynamic_charge_controls] Date range spans {total_days:.1f} days (>= 30); splitting ideal schedule into {len(blocks)} calendar-month block(s): {blocks}")
+
+    sch_parts = []
+    for block_start, block_end_exclusive in blocks:
+        if block_end_exclusive is None:
+            # Single-block case: preserve original inclusive '<=' filtering on end_date exactly.
+            sch_block = df.loc[(df['datetime'] >= info["start_date"]) & (df['datetime'] <= info["end_date"])]
+        else:
+            sch_block = df.loc[(df['datetime'] >= block_start) & (df['datetime'] < block_end_exclusive)]
+        # df comes from preprocess_baseline() with a DatetimeIndex ('datetime' set as the index).
+        # The optimization loop relies on a plain sequential integer index (e.g. cheap_hour.name + 1
+        # meaning "the next hour", int(cheap_hour.name) casts, etc.), so reset to a RangeIndex here
+        # while keeping 'datetime' available as a regular column for date-based filtering/lookups.
+        sch_block = sch_block.reset_index(drop=True)
+
+        if debug: print(f"[dynamic_charge_controls] Running ideal schedule block: {block_start} to {block_end_exclusive} ({len(sch_block.index)} hours)")
+
+        sch_block = _run_ideal_schedule_loop(sch_block, info, demand_charge_rate, rate)
+        sch_parts.append(sch_block)
+
+    # Concatenate all periods (aka "blocks") into a single 'sch' dataframe for the entire runperiod to match the format required for the subsequent scheduling loops.
+    sch = pd.concat(sch_parts, ignore_index=True)
+
     if debug: 
         sch['mode_temp'] = np.sign(sch['Cooling'] - sch['Thermal Load [kW]'])
         print('BEFORE consolidate_charging_hours()')
         print(sch['mode_temp'].value_counts())
 
-    # Consolidate charging hours
+    # -------------------------------------------
+    # Consolidate charging hours function (2nd loop)
+    # -------------------------------------------
     sch = consolidate_charging_hours(sch, demand_charge_rate)
 
     if debug: 
@@ -1209,7 +1315,7 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
         print(sch['mode_temp'].value_counts())
 
     # ------------------------------------------
-    # Second loop to generate schedule for charging and discharging periods and set charging temperatures
+    # Generate schedule for charging and discharging periods and set charging temperatures (3rd loop)
     # -------------------------------------------
 
     dms = sch[['datetime', 'Thermal Load [kW]', rate, 'Dry Bulb Temperature','Demand Period', 'COP', 'Cooling','Cost [kWh]', 'Electricity Consumption', 'Storage']].copy()
@@ -1259,7 +1365,12 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
         if i == i_prev:
             repeat_count += 1
             if repeat_count > 3:
-                print("Hit repeat_count limit, stopping to avoid infinite loop")
+                # New - condition to just increment i rather than stopping the entire loop (seems to work for most cases)
+                print("Hit repeat_count limit of 3, increment and continue to avoid infinite loop")
+                i += 1
+                continue
+            elif repeat_count > 5: # aggressive failsafe - stop everything to avoid total crash from an older version. Kept as a last-resort, but it _should_ be prevented by the `continue` above
+                print("[dynamic_charge_controls] WARNING: Hit repeat_count limit of 5, stopping schedule optimization at incomplete state to avoid infinite loop")
                 break
         else:
             repeat_count = 0
@@ -1302,8 +1413,6 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
             # rounding to 4 decimal places is mostly for readability
             target_T = round(float(ratio * (min_charge_temp + 1) - 1), 4)
             # print(f"target_T = {target_T}")
-            # mod target_T --> not really needed
-            # if dms['Load Rank'].iloc[i] > 
 
             # Look back and ahead to avoid short-term changes in charging temperature
             if (target_T > previous_state) and (i < (len(sch.index) - 1)): # temps are negative, so greater Target T means less cooling req
@@ -1318,12 +1427,11 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
                 pct_of_max_load =  load / max_load
                 # assuming charge rate is proportional 
                 # eg 100% of max load --> reduce to whatever we set as the "min" value 
-                # 0.4 * -2.8 - 1
                 target_T_limit = round(float((pct_of_max_load - 0.60) * (min_charge_temp + 1) - 1), 4) 
                 if debug: print(f"limit target_T to smaller of {target_T_limit} or {target_T} °C due to high base load {round(load,2)} kW, {round(pct_of_max_load,3)} %")
 
 
-            # This was an experiment to change charge start sequence based on base load. Didn't help in v15. Trying again with less extreme temp diffs in v16
+            # This was an experiment to change charge start sequence based on base load - has minor impact (if any), but keeping for now
             if load > load30:
                 if debug: print(f"activating high_base_load mode. base_load = {load} kW")
                 charge_start_sequence = charge_start_sequence_high_base_load
@@ -1378,12 +1486,9 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
                     # make this hour charge
                     next_hr_diff = dms['Cooling'].iloc[i+1] - dms['Thermal Load [kW]'].iloc[i+1]
                     if debug: print(f"begin charge early instead of Normal mode: {i}, original cooling {dms['Cooling'].iloc[i]} kWh, next_hr_diff = {next_hr_diff}")
-                    # dms['Cooling'].iloc[i] = dms['Thermal Load [kW]'].iloc[i] + next_hr_diff
-                    # dms.at[i, 'Cooling'] = load + next_hr_diff
                     # FIX: Assign using .loc with the actual index label of the i-th row
                     actual_index = dms.index[i]
                     dms.loc[actual_index, 'Cooling'] = load + next_hr_diff # + min_operation_increment
-                    # cooling = dms.at[i, 'Cooling']
                     if debug: print(f"Next hour will charge {next_hr_diff} kWh. Set cooling to {dms['Cooling'].iloc[i]} = {load + next_hr_diff} kWh")
                     # continue # redo this hour
                     i -= 1 # sloppier way to redo this hour to try to fix infinite loop issues
@@ -1396,8 +1501,7 @@ def generate_schedule(baseline_run_path, demand_charge_schedule=None, demand_cha
 
             # If none of the above overrides apply, then it's actually in Normal mode.
             previous_state = 6.7
-            
-            # previous_state = 6.7
+
         # check
         # if len(wsch) != timesteps_per_hour: 
         #     print('WARNING: len(wsch) != timesteps_per_hour ')
